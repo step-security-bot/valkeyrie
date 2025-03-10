@@ -1,0 +1,35 @@
+{
+  "name": "valkeyrie",
+  "private": true,
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "import": "./dist/valkeyrie.js",
+      "require": "./dist/valkeyrie.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "author": "Maksim Sinik <maksim@sinik.it>",
+  "license": "MIT",
+  "scripts": {
+    "build": "rimraf ./dist && tsc -p tsconfig.build.json",
+    "lint": "biome check src test",
+    "fmt": "biome format src test",
+    "prepublish": "pnpm build",
+    "test": "tsx --test ./test/*.ts",
+    "test:watch": "tsx --watch --test ./test/*.ts",
+    "test:coverage": "c8 --all --src src --reporter lcov --reporter text tsx --test ./test/*.ts"
+  },
+  "devDependencies": {
+    "@biomejs/biome": "^1.9.4",
+    "@ducktors/tsconfig": "^1.0.0",
+    "@types/node": "^22.13.9",
+    "rimraf": "^6.0.1",
+    "typescript": "^5.8.2"
+  },
+  "files": [
+    "dist"
+  ]
+}
