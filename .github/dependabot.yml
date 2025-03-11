@@ -23,14 +23,3 @@ updates:
       - "matteovivona"
     reviewers:
       - "matteovivona"
-
-  - package-ecosystem: "docker"
-    directory: "/"
-    schedule:
-      interval: "daily"
-    commit-message:
-      prefix: "fix(docker)"
-    assignees:
-      - "matteovivona"
-    reviewers:
-      - "matteovivona"
