@@ -1,7 +1,8 @@
 import assert, { AssertionError } from 'node:assert'
 import { describe, test } from 'node:test'
 import { inspect } from 'node:util'
-import { type Key, KvU64, type Mutation, Valkeyrie } from '../src/valkeyrie.js'
+import { KvU64 } from '../src/kvu64.js'
+import { type Key, type Mutation, Valkeyrie } from '../src/valkeyrie.js'
 
 describe('test', async () => {
   async function dbTest(

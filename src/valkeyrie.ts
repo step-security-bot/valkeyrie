@@ -1,66 +1,31 @@
 import { DatabaseSync } from 'node:sqlite'
 import { deserialize, serialize } from 'node:v8'
+import { KvU64 } from './kvu64.js'
+
+type PrimitveValue =
+  | undefined
+  | null
+  | boolean
+  | number
+  | string
+  | bigint
+  | Uint8Array
+  | ArrayBuffer
+  | PrimitveValue[]
+  | { [key: string]: PrimitveValue }
+  | Map<PrimitveValue, PrimitveValue>
+  | Set<PrimitveValue>
+  | Date
+  | RegExp
+export type Value = PrimitveValue | KvU64
+export type KeyPart = Uint8Array | string | number | bigint | boolean
+export type Key = KeyPart[]
 
 interface DriverValue {
   key: Buffer
   value: Buffer
   versionstamp: string
 }
-
-type PrimitveValue =
-  | string
-  | number
-  | bigint
-  | boolean
-  | null
-  | undefined
-  | Date
-  | Uint8Array
-  | ArrayBuffer
-  | KvU64
-type AcceptedValue =
-  | PrimitveValue
-  | AcceptedValue[]
-  | { [key: string]: AcceptedValue }
-
-export type KeyPart = string | number | boolean | Uint8Array | bigint
-export type Key = KeyPart[]
-
-interface Value<T = unknown> {
-  key: Key
-  value: T
-  versionstamp: string
-}
-
-interface NullValue {
-  key: Key
-  value: null
-  versionstamp: null
-}
-
-interface AtomicCheck {
-  key: Key
-  versionstamp: string | null
-}
-
-type ListSelector =
-  | { prefix: Key }
-  | { prefix: Key; start: Key }
-  | { prefix: Key; end: Key }
-  | { start: Key; end: Key }
-
-interface ListOptions {
-  limit?: number
-  cursor?: string
-  reverse?: boolean
-  consistency?: 'strong' | 'eventual'
-  batchSize?: number
-}
-
-interface SetOptions {
-  expireIn?: number
-}
-
 interface Functions {
   close: () => Promise<void>
   get: (keyHash: string, now: number) => Promise<DriverValue | undefined>
@@ -69,13 +34,7 @@ interface Functions {
     keyParts: Buffer,
     value: Buffer,
     versionstamp: string,
-  ) => Promise<void>
-  setWithExpiry: (
-    keyHash: string,
-    keyParts: Buffer,
-    value: Buffer,
-    versionstamp: string,
-    expiresAt: number,
+    expiresAt?: number,
   ) => Promise<void>
   delete: (keyHash: string) => Promise<void>
   list: (
@@ -84,13 +43,7 @@ interface Functions {
     prefixHash: string,
     now: number,
     limit: number,
-  ) => Promise<DriverValue[]>
-  listReverse: (
-    startHash: string,
-    endHash: string,
-    prefixHash: string,
-    now: number,
-    limit: number,
+    reverse?: boolean,
   ) => Promise<DriverValue[]>
   cleanup: (now: number) => Promise<void>
   beginTransaction: () => Promise<void>
@@ -151,48 +104,53 @@ const sqliteDriver = defineDriver(async (path = ':memory:') => {
     cleanup: db.prepare('DELETE FROM kv_store WHERE expires_at <= ?'),
   }
 
-  // Prepare statements for better performance
   return {
-    close: async () => db.close(),
+    close: async () => {
+      db.close()
+    },
     get: async (keyHash: string, now: number) =>
       statements.get.get(keyHash, now) as DriverValue | undefined,
-    set: async (keyHash, key, serializedValue, versionstamp) => {
-      statements.set.run(keyHash, key, serializedValue, versionstamp)
-    },
-    setWithExpiry: async (
-      keyHash,
-      key,
-      serializedValue,
-      versionstamp,
-      expiresAt,
-    ) => {
-      statements.setWithExpiry.run(
-        keyHash,
-        key,
-        serializedValue,
-        versionstamp,
-        expiresAt,
-      )
+    set: async (keyHash, key, serializedValue, versionstamp, expiresAt) => {
+      if (expiresAt) {
+        statements.setWithExpiry.run(
+          keyHash,
+          key,
+          serializedValue,
+          versionstamp,
+          expiresAt,
+        )
+      } else {
+        statements.set.run(keyHash, key, serializedValue, versionstamp)
+      }
     },
     delete: async (keyHash) => {
       statements.delete.run(keyHash)
     },
-    list: async (startHash, endHash, prefixHash, now, limit) =>
-      statements.list.all(
+    list: async (
+      startHash,
+      endHash,
+      prefixHash,
+      now,
+      limit,
+      reverse = false,
+    ) => {
+      if (reverse) {
+        return statements.listReverse.all(
+          startHash,
+          endHash,
+          prefixHash,
+          now,
+          limit,
+        ) as DriverValue[]
+      }
+      return statements.list.all(
         startHash,
         endHash,
         prefixHash,
         now,
         limit,
-      ) as DriverValue[],
-    listReverse: async (startHash, endHash, prefixHash, now, limit) =>
-      statements.listReverse.all(
-        startHash,
-        endHash,
-        prefixHash,
-        now,
-        limit,
-      ) as DriverValue[],
+      ) as DriverValue[]
+    },
     cleanup: async (now) => {
       statements.cleanup.run(now)
     },
@@ -208,196 +166,64 @@ const sqliteDriver = defineDriver(async (path = ':memory:') => {
   }
 })
 
-interface Check {
+interface AtomicCheck {
   key: Key
   versionstamp: string | null
 }
 
-export class KvU64 {
-  readonly value: bigint
+type ListSelector =
+  | { prefix: Key }
+  | { prefix: Key; start: Key }
+  | { prefix: Key; end: Key }
+  | { start: Key; end: Key }
 
-  constructor(value: bigint) {
-    if (value < 0n) {
-      throw new RangeError('Value must be non-negative')
-    }
-    if (value > 0xffffffffffffffffn) {
-      throw new RangeError('Value must not exceed 64 bits')
-    }
-    this.value = value
-  }
+interface ListOptions {
+  limit?: number
+  cursor?: string
+  reverse?: boolean
+  consistency?: 'strong' | 'eventual'
+  batchSize?: number
+}
 
-  valueOf(): bigint {
-    return this.value
-  }
-
-  toString(): string {
-    return this.value.toString()
-  }
-
-  toJSON(): string {
-    return this.value.toString()
-  }
-
-  [Symbol.for('nodejs.util.inspect.custom')](): string {
-    return `[KvU64: ${this.value}n]`
-  }
+interface SetOptions {
+  expireIn?: number
+}
+export interface Check {
+  key: Key
+  versionstamp: string | null
 }
 
 export type Mutation = { key: Key } & (
-  | { type: 'set'; value: AcceptedValue; expireIn?: number }
+  | { type: 'set'; value: Value; expireIn?: number }
   | { type: 'delete' }
   | { type: 'sum'; value: KvU64 }
   | { type: 'max'; value: KvU64 }
   | { type: 'min'; value: KvU64 }
 )
 
-// Internal class - not exported
-class Atomic {
-  private checks: Check[] = []
-  private mutations: Mutation[] = []
-  private kv: Valkeyrie
-  private totalMutationSize = 0
-  private totalKeySize = 0
-
-  constructor(kv: Valkeyrie) {
-    this.kv = kv
-  }
-
-  private validateVersionstamp(versionstamp: string | null): void {
-    if (versionstamp === null) return
-    if (typeof versionstamp !== 'string') {
-      throw new TypeError('Versionstamp must be a string or null')
-    }
-    if (versionstamp.length !== 20) {
-      throw new TypeError('Versionstamp must be 20 characters long')
-    }
-    if (!/^[0-9a-f]{20}$/.test(versionstamp)) {
-      throw new TypeError('Versionstamp must be a hex string')
-    }
-  }
-
-  check(...checks: AtomicCheck[]): Atomic {
-    for (const check of checks) {
-      if (this.checks.length >= 100) {
-        throw new TypeError('Max 100 checks per atomic operation')
-      }
-      this.kv.validateKeysAreArrays([check.key])
-      this.validateVersionstamp(check.versionstamp)
-      this.checks.push(check)
-    }
-    return this
-  }
-
-  mutate(...mutations: Mutation[]): Atomic {
-    for (const mutation of mutations) {
-      if (this.mutations.length >= 1000) {
-        throw new TypeError('Max 1000 mutations per atomic operation')
-      }
-      this.kv.validateKeysAreArrays([mutation.key])
-      if (mutation.key.length === 0) {
-        throw new Error('Key cannot be empty')
-      }
-
-      // Track key size without validation
-      const keySize = serialize(mutation.key).length
-      this.totalKeySize += keySize
-
-      // Track mutation size without validation
-      let mutationSize = keySize
-      if ('value' in mutation) {
-        if (
-          mutation.type === 'sum' ||
-          mutation.type === 'max' ||
-          mutation.type === 'min'
-        ) {
-          mutationSize += 8 // 64-bit integer size
-        } else {
-          mutationSize += serialize(mutation.value).length
-        }
-      }
-      this.totalMutationSize += mutationSize
-
-      // Validate mutation type and required fields
-      switch (mutation.type) {
-        case 'set':
-          if (!('value' in mutation)) {
-            throw new TypeError('Set mutation requires a value')
-          }
-          break
-        case 'delete':
-          if ('value' in mutation) {
-            throw new TypeError('Delete mutation cannot have a value')
-          }
-          break
-        case 'sum':
-        case 'max':
-        case 'min':
-          if (!('value' in mutation) || !(mutation.value instanceof KvU64)) {
-            throw new TypeError(
-              `${mutation.type} mutation requires a KvU64 value`,
-            )
-          }
-          break
-        default:
-          throw new TypeError('Invalid mutation type')
-      }
-
-      this.mutations.push(mutation)
-    }
-    return this
-  }
-
-  set(key: Key, value: AcceptedValue, options: SetOptions = {}): Atomic {
-    return this.mutate({
-      type: 'set',
-      key,
-      value,
-      ...(options.expireIn ? { expireIn: options.expireIn } : {}),
-    })
-  }
-
-  delete(key: Key): Atomic {
-    return this.mutate({ type: 'delete', key })
-  }
-
-  sum(key: Key, value: bigint | KvU64): Atomic {
-    const u64Value = value instanceof KvU64 ? value : new KvU64(BigInt(value))
-    return this.mutate({ type: 'sum', key, value: u64Value })
-  }
-
-  max(key: Key, value: bigint | KvU64): Atomic {
-    const u64Value = value instanceof KvU64 ? value : new KvU64(BigInt(value))
-    return this.mutate({ type: 'max', key, value: u64Value })
-  }
-
-  min(key: Key, value: bigint | KvU64): Atomic {
-    const u64Value = value instanceof KvU64 ? value : new KvU64(BigInt(value))
-    return this.mutate({ type: 'min', key, value: u64Value })
-  }
-
-  async commit(): Promise<{ ok: true; versionstamp: string } | { ok: false }> {
-    // Validate total sizes before executing the atomic operation
-    if (this.totalKeySize > 81920) {
-      throw new TypeError('Total key size too large (max 81920 bytes)')
-    }
-    if (this.totalMutationSize > 819200) {
-      throw new TypeError('Total mutation size too large (max 819200 bytes)')
-    }
-    return this.kv.executeAtomicOperation(this.checks, this.mutations)
-  }
+interface Entry<T = unknown> {
+  key: Key
+  value: T
+  versionstamp: string
 }
+export type EntryMaybe<T = unknown> =
+  | Entry<T>
+  | {
+      key: Key
+      value: null
+      versionstamp: null
+    }
 
 export class Valkeyrie {
   private static internalConstructor = false
-  private functions: Functions
+  private driver: Functions
   private lastVersionstamp: bigint
-  private queueListeners: Set<(msg: unknown) => void> = new Set()
 
   private constructor(functions: Functions) {
     if (!Valkeyrie.internalConstructor) {
       throw new TypeError('Use Valkeyrie.open() to create a new instance')
     }
-    this.functions = functions
+    this.driver = functions
     this.lastVersionstamp = 0n
   }
 
@@ -409,31 +235,17 @@ export class Valkeyrie {
   }
 
   async close(): Promise<void> {
-    this.queueListeners.clear()
-    await this.functions.close()
+    await this.driver.close()
   }
 
-  listenQueue(callback: (msg: unknown) => void): Promise<void> {
-    this.queueListeners.add(callback)
-    return Promise.resolve()
-  }
+  /**
+   * Validates that the provided keys are arrays.
+   *
+   * @param keys - The keys to validate.
+   * @throws {TypeError} If any key is not an array.
+   */
 
-  async enqueue(
-    value: AcceptedValue,
-  ): Promise<{ ok: true; versionstamp: string }> {
-    const versionstamp = this.generateVersionstamp()
-    const key = ['__queue__', versionstamp]
-    await this.set(key, value)
-
-    // Notify all listeners
-    for (const listener of this.queueListeners) {
-      listener(value)
-    }
-
-    return { ok: true, versionstamp }
-  }
-
-  public validateKeysAreArrays(keys: unknown[]): asserts keys is Key[] {
+  public validateKeys(keys: unknown[]): asserts keys is Key[] {
     for (const key of keys) {
       if (!Array.isArray(key)) {
         throw new TypeError('Key must be an array')
@@ -441,6 +253,15 @@ export class Valkeyrie {
     }
   }
 
+  /**
+   * Generates a unique versionstamp for each operation.
+   * This method ensures that each versionstamp is monotonically increasing,
+   * even within the same microsecond, by using the current timestamp in microseconds
+   * and incrementing the last used versionstamp if it's not greater than the current timestamp.
+   * The generated versionstamp is a hexadecimal string representation of the BigInt value.
+   *
+   * @returns A string representing the generated versionstamp.
+   */
   private generateVersionstamp(): string {
     // Get current timestamp in microseconds
     const now = BigInt(Date.now()) * 1000n
@@ -449,6 +270,7 @@ export class Valkeyrie {
     this.lastVersionstamp =
       this.lastVersionstamp < now ? now : this.lastVersionstamp + 1n
 
+    // Convert the BigInt to a hexadecimal string and pad it to 20 characters
     return this.lastVersionstamp.toString(16).padStart(20, '0')
   }
 
@@ -460,7 +282,7 @@ export class Valkeyrie {
     return deserialize(keyStr)
   }
 
-  private serializeValue(value: AcceptedValue): Buffer {
+  private serializeValue(value: Value): Buffer {
     const serialized = serialize(
       value instanceof KvU64
         ? { value: value.value, '$valkeyrie.u64': true }
@@ -473,7 +295,7 @@ export class Valkeyrie {
     return serialized
   }
 
-  private deserializeValue(value: Buffer): AcceptedValue {
+  private deserializeValue(value: Buffer): Value {
     const d = deserialize(value)
     if (d && typeof d === 'object' && '$valkeyrie.u64' in d) {
       return new KvU64(d.value)
@@ -481,8 +303,26 @@ export class Valkeyrie {
     return d
   }
 
+  /**
+   * Generates a hash for a given key. This method is crucial for indexing and storing keys in the database.
+   * It converts each part of the key into a specific byte format based on its type, following Deno.KV's encoding format.
+   * The format for each type is as follows:
+   * - Uint8Array: 0x01 + bytes + 0x00
+   * - String: 0x02 + utf8 bytes + 0x00
+   * - BigInt: 0x03 + 8 bytes int64 + 0x00
+   * - Number: 0x04 + 8 bytes double + 0x00
+   * - Boolean: 0x05 + single byte + 0x00
+   *
+   * After converting each part, they are concatenated with a null byte delimiter to form the full key.
+   * The full key is then converted to a base64 string and any trailing '=' characters are removed.
+   * This method ensures that keys are consistently formatted and can be reliably hashed for storage and retrieval.
+   *
+   * Note that key ordering is determined by a lexicographical comparison of their parts, with the first part being the most significant and the last part being the least significant. Additionally, key comparisons are case sensitive.
+   *
+   * @param {Key} key - The key to be hashed.
+   * @returns {string} - The base64 string representation of the hashed key.
+   */
   private hashKey(key: Key): string {
-    // Convert each key part to bytes following Deno KV's encoding format
     const parts = key.map((part) => {
       let bytes: Buffer
 
@@ -533,14 +373,14 @@ export class Valkeyrie {
     return fullKey.toString('base64').replace(/=+$/, '')
   }
 
-  async get<T = unknown>(key: Key): Promise<Value<T> | NullValue> {
-    this.validateKeysAreArrays([key])
+  async get<T = unknown>(key: Key): Promise<EntryMaybe<T>> {
+    this.validateKeys([key])
     if (key.length === 0) {
       throw new Error('Key cannot be empty')
     }
     const keyHash = this.hashKey(key)
     const now = Date.now()
-    const result = await this.functions.get(keyHash, now)
+    const result = await this.driver.get(keyHash, now)
 
     if (!result) {
       return { key, value: null, versionstamp: null }
@@ -553,20 +393,20 @@ export class Valkeyrie {
     }
   }
 
-  async getMany(keys: Key[]): Promise<Array<Value<unknown> | NullValue>> {
-    this.validateKeysAreArrays(keys)
+  async getMany(keys: Key[]): Promise<EntryMaybe[]> {
+    this.validateKeys(keys)
     if (keys.length > 10) {
       throw new TypeError('Too many ranges (max 10)')
     }
     return Promise.all(keys.map((key) => this.get(key)))
   }
 
-  async set<T extends AcceptedValue>(
+  async set<T extends Value>(
     key: Key,
     value: T,
     options: SetOptions = {},
   ): Promise<{ ok: true; versionstamp: string }> {
-    this.validateKeysAreArrays([key])
+    this.validateKeys([key])
     if (key.length === 0) {
       throw new Error('Key cannot be empty')
     }
@@ -575,26 +415,21 @@ export class Valkeyrie {
     const serializedValue = this.serializeValue(value)
     const versionstamp = this.generateVersionstamp()
 
-    if (options.expireIn) {
-      const expiresAt = Date.now() + options.expireIn
-      await this.functions.setWithExpiry(
-        keyHash,
-        keyParts,
-        serializedValue,
-        versionstamp,
-        expiresAt,
-      )
-    } else {
-      await this.functions.set(keyHash, keyParts, serializedValue, versionstamp)
-    }
+    await this.driver.set(
+      keyHash,
+      keyParts,
+      serializedValue,
+      versionstamp,
+      options.expireIn ? Date.now() + options.expireIn : undefined,
+    )
 
     return { ok: true, versionstamp }
   }
 
   async delete(key: Key): Promise<void> {
-    this.validateKeysAreArrays([key])
+    this.validateKeys([key])
     const keyHash = this.hashKey(key)
-    await this.functions.delete(keyHash)
+    await this.driver.delete(keyHash)
   }
 
   private validatePrefixKey(
@@ -625,7 +460,7 @@ export class Valkeyrie {
       batchSize: number
       reverse: boolean
     },
-  ): AsyncIterableIterator<Value<T>> {
+  ): AsyncIterableIterator<Entry<T>> {
     const { limit, batchSize, reverse } = options
     if (batchSize > 1000) {
       throw new TypeError('Too many entries (max 1000)')
@@ -635,16 +470,15 @@ export class Valkeyrie {
     let currentStartHash = startHash
     let currentEndHash = endHash
 
-    const list = reverse ? this.functions.listReverse : this.functions.list
-
     while (remainingLimit > 0) {
       const currentBatchSize = Math.min(batchSize, remainingLimit)
-      const results = await list(
+      const results = await this.driver.list(
         currentStartHash,
         currentEndHash,
         prefixHash,
         now,
         currentBatchSize,
+        reverse,
       )
       if (results.length === 0) break
 
@@ -829,7 +663,7 @@ export class Valkeyrie {
   list<T = unknown>(
     selector: ListSelector,
     options: ListOptions = {},
-  ): AsyncIterableIterator<Value<T>> & { cursor: string } {
+  ): AsyncIterableIterator<Entry<T>> & { readonly cursor: string } {
     this.validateSelector(selector)
 
     const { limit = 500, reverse = false, batchSize = 500, cursor } = options
@@ -896,14 +730,14 @@ export class Valkeyrie {
         if (!lastPart) return ''
         return self.hashKey([lastPart])
       },
-    } as AsyncIterableIterator<Value<T>> & { cursor: string }
+    }
 
     return wrapper
   }
 
   async cleanup(): Promise<void> {
     const now = Date.now()
-    this.functions.cleanup(now)
+    this.driver.cleanup(now)
   }
 
   atomic(): Atomic {
@@ -925,13 +759,13 @@ export class Valkeyrie {
     const versionstamp = this.generateVersionstamp()
 
     try {
-      await this.functions.beginTransaction()
+      await this.driver.beginTransaction()
 
       // Verify all checks pass within the transaction
       for (const check of checks) {
         const result = await this.get(check.key)
         if (result.versionstamp !== check.versionstamp) {
-          await this.functions.rollback()
+          await this.driver.rollback()
           return { ok: false }
         }
       }
@@ -942,13 +776,13 @@ export class Valkeyrie {
         const keyParts = this.serializeKey(mutation.key)
 
         if (mutation.type === 'delete') {
-          await this.functions.delete(keyHash)
+          await this.driver.delete(keyHash)
         } else if (mutation.type === 'set') {
           const serializedValue = this.serializeValue(mutation.value)
 
           if (mutation.expireIn) {
             const expiresAt = Date.now() + mutation.expireIn
-            await this.functions.setWithExpiry(
+            await this.driver.set(
               keyHash,
               keyParts,
               serializedValue,
@@ -956,7 +790,7 @@ export class Valkeyrie {
               expiresAt,
             )
           } else {
-            await this.functions.set(
+            await this.driver.set(
               keyHash,
               keyParts,
               serializedValue,
@@ -1013,7 +847,7 @@ export class Valkeyrie {
 
           // Store the KvU64 instance directly
           const serializedValue = this.serializeValue(newValue)
-          await this.functions.set(
+          await this.driver.set(
             keyHash,
             keyParts,
             serializedValue,
@@ -1022,14 +856,150 @@ export class Valkeyrie {
         }
       }
 
-      await this.functions.commit()
+      await this.driver.commit()
       return { ok: true, versionstamp }
     } catch (error) {
-      await this.functions.rollback()
+      await this.driver.rollback()
       if (error instanceof TypeError) {
         throw error
       }
       return { ok: false }
     }
+  }
+}
+
+// Internal class - not exported
+class Atomic {
+  private checks: Check[] = []
+  private mutations: Mutation[] = []
+  private kv: Valkeyrie
+  private totalMutationSize = 0
+  private totalKeySize = 0
+
+  constructor(kv: Valkeyrie) {
+    this.kv = kv
+  }
+
+  private validateVersionstamp(versionstamp: string | null): void {
+    if (versionstamp === null) return
+    if (typeof versionstamp !== 'string') {
+      throw new TypeError('Versionstamp must be a string or null')
+    }
+    if (versionstamp.length !== 20) {
+      throw new TypeError('Versionstamp must be 20 characters long')
+    }
+    if (!/^[0-9a-f]{20}$/.test(versionstamp)) {
+      throw new TypeError('Versionstamp must be a hex string')
+    }
+  }
+
+  check(...checks: AtomicCheck[]): Atomic {
+    for (const check of checks) {
+      if (this.checks.length >= 100) {
+        throw new TypeError('Max 100 checks per atomic operation')
+      }
+      this.kv.validateKeys([check.key])
+      this.validateVersionstamp(check.versionstamp)
+      this.checks.push(check)
+    }
+    return this
+  }
+
+  mutate(...mutations: Mutation[]): Atomic {
+    for (const mutation of mutations) {
+      if (this.mutations.length >= 1000) {
+        throw new TypeError('Max 1000 mutations per atomic operation')
+      }
+      this.kv.validateKeys([mutation.key])
+      if (mutation.key.length === 0) {
+        throw new Error('Key cannot be empty')
+      }
+
+      // Track key size without validation
+      const keySize = serialize(mutation.key).length
+      this.totalKeySize += keySize
+
+      // Track mutation size without validation
+      let mutationSize = keySize
+      if ('value' in mutation) {
+        if (
+          mutation.type === 'sum' ||
+          mutation.type === 'max' ||
+          mutation.type === 'min'
+        ) {
+          mutationSize += 8 // 64-bit integer size
+        } else {
+          mutationSize += serialize(mutation.value).length
+        }
+      }
+      this.totalMutationSize += mutationSize
+
+      // Validate mutation type and required fields
+      switch (mutation.type) {
+        case 'set':
+          if (!('value' in mutation)) {
+            throw new TypeError('Set mutation requires a value')
+          }
+          break
+        case 'delete':
+          if ('value' in mutation) {
+            throw new TypeError('Delete mutation cannot have a value')
+          }
+          break
+        case 'sum':
+        case 'max':
+        case 'min':
+          if (!('value' in mutation) || !(mutation.value instanceof KvU64)) {
+            throw new TypeError(
+              `${mutation.type} mutation requires a KvU64 value`,
+            )
+          }
+          break
+        default:
+          throw new TypeError('Invalid mutation type')
+      }
+
+      this.mutations.push(mutation)
+    }
+    return this
+  }
+
+  set(key: Key, value: Value, options: SetOptions = {}): Atomic {
+    return this.mutate({
+      type: 'set',
+      key,
+      value,
+      ...(options.expireIn ? { expireIn: options.expireIn } : {}),
+    })
+  }
+
+  delete(key: Key): Atomic {
+    return this.mutate({ type: 'delete', key })
+  }
+
+  sum(key: Key, value: bigint | KvU64): Atomic {
+    const u64Value = value instanceof KvU64 ? value : new KvU64(BigInt(value))
+    return this.mutate({ type: 'sum', key, value: u64Value })
+  }
+
+  max(key: Key, value: bigint | KvU64): Atomic {
+    const u64Value = value instanceof KvU64 ? value : new KvU64(BigInt(value))
+    return this.mutate({ type: 'max', key, value: u64Value })
+  }
+
+  min(key: Key, value: bigint | KvU64): Atomic {
+    const u64Value = value instanceof KvU64 ? value : new KvU64(BigInt(value))
+    return this.mutate({ type: 'min', key, value: u64Value })
+  }
+
+  async commit(): Promise<{ ok: true; versionstamp: string } | { ok: false }> {
+    // Validate total sizes before executing the atomic operation
+    if (this.totalKeySize > 81920) {
+      throw new TypeError('Total key size too large (max 81920 bytes)')
+    }
+    if (this.totalMutationSize > 819200) {
+      throw new TypeError('Total mutation size too large (max 819200 bytes)')
+    }
+    return this.kv.executeAtomicOperation(this.checks, this.mutations)
   }
 }
