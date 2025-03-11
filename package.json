@@ -13,23 +13,45 @@
   },
   "author": "Maksim Sinik <maksim@sinik.it>",
   "license": "MIT",
+  "engines": {
+    "node": ">=20"
+  },
+  "packageManager": "pnpm@10.6.2",
   "scripts": {
-    "build": "rimraf ./dist && tsc -p tsconfig.build.json",
+    "build": "turbo rimraf ./dist && tsc -p tsconfig.build.json",
     "lint": "biome check src test",
     "fmt": "biome format src test",
     "prepublish": "pnpm build",
+    "commitlint": "commitlint",
+    "prepare": "husky install",
+    "check-updates": "pnpm outdated --recursive --long",
     "test": "tsx --test ./test/*.ts",
     "test:watch": "tsx --watch --test ./test/*.ts",
     "test:coverage": "c8 --all --src src --reporter lcov --reporter text tsx --test ./test/*.ts"
   },
   "devDependencies": {
     "@biomejs/biome": "^1.9.4",
+    "@changesets/changelog-github": "^0.5.1",
+    "@changesets/cli": "^2.28.1",
+    "@commitlint/cli": "^19.8.0",
+    "@commitlint/config-conventional": "^19.8.0",
+    "commitlint-plugin-function-rules": "^4.0.1",
+    "@commitlint/lint": "^19.8.0",
+    "@commitlint/prompt": "^19.8.0",
     "@ducktors/tsconfig": "^1.0.0",
     "@types/node": "^22.13.9",
+    "husky": "^9.1.7",
+    "lint-staged": "^15.4.3",
     "rimraf": "^6.0.1",
+    "turbo": "^2.4.4",
     "typescript": "^5.8.2"
   },
   "files": [
     "dist"
-  ]
+  ],
+  "pnpm": {
+    "onlyBuiltDependencies": [
+      "@biomejs/biome"
+    ]
+  }
 }

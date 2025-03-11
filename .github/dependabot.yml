@@ -1,0 +1,36 @@
+version: 2
+updates:
+  - package-ecosystem: "npm"
+    directory: "/"
+    schedule:
+      interval: "daily"
+    open-pull-requests-limit: 0
+    commit-message:
+      prefix: "fix(deps)"
+      prefix-development: "chore(deps):"
+    assignees:
+      - "matteovivona"
+    reviewers:
+      - "matteovivona"
+
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "daily"
+    commit-message:
+      prefix: "chore(actions)"
+    assignees:
+      - "matteovivona"
+    reviewers:
+      - "matteovivona"
+
+  - package-ecosystem: "docker"
+    directory: "/"
+    schedule:
+      interval: "daily"
+    commit-message:
+      prefix: "fix(docker)"
+    assignees:
+      - "matteovivona"
+    reviewers:
+      - "matteovivona"

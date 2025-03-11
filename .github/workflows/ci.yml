@@ -1,0 +1,129 @@
+name: CI
+
+on:
+  merge_group:
+  pull_request:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  PNPM_VERSION: 10.6.2
+
+permissions: read-all
+
+jobs:
+  commitlint:
+    name: Commit
+    runs-on: ubuntu-latest
+    steps:
+      - name: Harden Runner
+        uses: step-security/harden-runner@4d991eb9b905ef189e4c376166672c3f2f230481 # v2.11.0
+        with:
+          egress-policy: audit
+
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          fetch-depth: 0
+      - uses: pnpm/action-setup@fe02b34f77f8bc703788d5817da081398fad5dd2 # v4.0.0
+        name: Install pnpm
+        with:
+          version: ${{ env.PNPM_VERSION }}
+      - name: Install with pnpm
+        run: pnpm install --frozen-lockfile
+      - name: Check commit message
+        uses: wagoid/commitlint-github-action@b948419dd99f3fd78a6548d48f94e3df7f6bf3ed # v6.2.1
+        with:
+          configFile: commitlint.config.cjs
+          failOnWarnings: false
+          helpURL: https://github.com/ducktors/valkeyrie#how-to-commit
+
+  install:
+    runs-on: ${{ matrix.os }}
+    name: Test Install
+    strategy:
+      matrix:
+        node-version: [22.x, 23.x]
+        os: [ubuntu-latest]
+    steps:
+      - name: Harden Runner
+        uses: step-security/harden-runner@4d991eb9b905ef189e4c376166672c3f2f230481 # v2.11.0
+        with:
+          egress-policy: audit
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        name: Checkout
+      - name: Use Node.js
+        uses: actions/setup-node@1d0ff469b7ec7b3cb9d8673fde0c81c44821de2a # v4.2.0
+        with:
+          node-version: ${{ matrix.node-version }}
+      - name: Install pnpm
+        uses: pnpm/action-setup@fe02b34f77f8bc703788d5817da081398fad5dd2 # v4.0.0
+        with:
+          version: ${{ env.PNPM_VERSION }}
+      - name: Prepack application
+        run: |
+          pnpm install
+          pnpm pack
+      - name: Get package.json version
+        id: package-version
+        uses: martinbeentjes/npm-get-version-action@3cf273023a0dda27efcd3164bdfb51908dd46a5b # main
+        with:
+          path: .
+      - name: Install with npm
+        run: |
+          cd ..
+          mkdir npm-repro
+          cd npm-repro
+          npm init -y
+          npm install ${{ github.workspace }}/valkeyrie-${{ steps.package-version.outputs.current-version }}.tgz
+      - name: Install with yarn
+        run: |
+          cd ..
+          mkdir yarn-repro
+          cd yarn-repro
+          corepack enable
+          yarn init -y
+          yarn add ${{ github.workspace }}/valkeyrie-${{ steps.package-version.outputs.current-version }}.tgz
+      - name: Install with pnpm
+        run: |
+          cd ..
+          mkdir pnpm-repro
+          cd pnpm-repro
+          npm init -y
+          pnpm add ${{ github.workspace }}/valkeyrie-${{ steps.package-version.outputs.current-version }}.tgz
+
+  build:
+    runs-on: ${{ matrix.os }}
+    name: Build
+    strategy:
+      matrix:
+        node-version: [22.x, 23.x]
+        os: [ubuntu-latest]
+    steps:
+      - name: Harden Runner
+        uses: step-security/harden-runner@4d991eb9b905ef189e4c376166672c3f2f230481 # v2.11.0
+        with:
+          egress-policy: audit
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        name: Checkout
+      - name: Use Node.js
+        uses: actions/setup-node@1d0ff469b7ec7b3cb9d8673fde0c81c44821de2a # v4.2.0
+        with:
+          node-version: ${{ matrix.node-version }}
+      - uses: pnpm/action-setup@fe02b34f77f8bc703788d5817da081398fad5dd2 # v4.0.0
+        name: Install pnpm
+        with:
+          version: ${{ env.PNPM_VERSION }}
+      - name: Install with pnpm
+        run: pnpm install
+      - name: Lint code
+        run: pnpm lint
+      - name: Build
+        run: pnpm build
+
