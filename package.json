@@ -17,8 +17,21 @@
   },
   "author": "Maksim Sinik <maksim@sinik.it>",
   "license": "MIT",
+    "keywords": [
+      "kv-db",
+      "kv",
+      "keyvalue"
+    ],
   "engines": {
     "node": ">=20"
+  },
+  "bugs": {
+      "url": "https://github.com/ducktors/valkeyrie/issues"
+  },
+  "homepage": "https://github.com/ducktors/valkeyrie#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/ducktors/valkeyrie.git"
   },
   "packageManager": "pnpm@10.6.2",
   "scripts": {
