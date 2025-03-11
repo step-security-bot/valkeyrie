@@ -5,6 +5,13 @@ on:
     branches:
       - main
 
+permissions:
+  id-token: write
+  contents: write
+  packages: write
+  pull-requests: write
+  issues: read
+
 env:
   PNPM_VERSION: 10.6.2
 
