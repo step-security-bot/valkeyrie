@@ -21,7 +21,7 @@ export type Value = PrimitveValue | KvU64
 export type KeyPart = Uint8Array | string | number | bigint | boolean
 export type Key = KeyPart[]
 
-interface Functions {
+interface Driver {
   close: () => Promise<void>
   get: (keyHash: string, now: number) => Promise<DriverValue | undefined>
   set: (
@@ -40,14 +40,12 @@ interface Functions {
     reverse?: boolean,
   ) => Promise<DriverValue[]>
   cleanup: (now: number) => Promise<void>
-  beginTransaction: () => Promise<void>
-  commit: () => Promise<void>
-  rollback: () => Promise<void>
+  withTransaction: <T>(callback: () => Promise<T>) => Promise<T>
 }
 
 export function defineDriver(
-  initDriver: ((path?: string) => Promise<Functions>) | Functions,
-): (path?: string) => Promise<Functions> {
+  initDriver: ((path?: string) => Promise<Driver>) | Driver,
+): (path?: string) => Promise<Driver> {
   if (initDriver instanceof Function) {
     return initDriver
   }
@@ -197,14 +195,16 @@ const sqliteDriver = defineDriver(async (path = ':memory:') => {
     cleanup: async (now) => {
       statements.cleanup.run(now)
     },
-    beginTransaction: async () => {
+    withTransaction: async <T>(callback: () => Promise<T>): Promise<T> => {
       db.exec('BEGIN TRANSACTION')
-    },
-    commit: async () => {
-      db.exec('COMMIT')
-    },
-    rollback: async () => {
-      db.exec('ROLLBACK')
+      try {
+        const result = await callback()
+        db.exec('COMMIT')
+        return result
+      } catch (error) {
+        db.exec('ROLLBACK')
+        throw error
+      }
     },
   }
 })
@@ -259,10 +259,10 @@ export type EntryMaybe<T = unknown> =
 
 export class Valkeyrie {
   private static internalConstructor = false
-  private driver: Functions
+  private driver: Driver
   private lastVersionstamp: bigint
 
-  private constructor(functions: Functions) {
+  private constructor(functions: Driver) {
     if (!Valkeyrie.internalConstructor) {
       throw new TypeError('Use Valkeyrie.open() to create a new instance')
     }
@@ -870,108 +870,101 @@ export class Valkeyrie {
     return new Atomic(this)
   }
 
-  // Friend method for Atomic class
-  executeAtomicOperation(
-    checks: Check[],
-    mutations: Mutation[],
-  ): Promise<{ ok: true; versionstamp: string } | { ok: false }> {
-    return this.executeAtomic(checks, mutations)
-  }
-
-  private async executeAtomic(
+  async executeAtomicOperation(
     checks: Check[],
     mutations: Mutation[],
   ): Promise<{ ok: true; versionstamp: string } | { ok: false }> {
     const versionstamp = this.generateVersionstamp()
 
     try {
-      await this.driver.beginTransaction()
-
-      // Verify all checks pass within the transaction
-      for (const check of checks) {
-        const result = await this.get(check.key)
-        if (result.versionstamp !== check.versionstamp) {
-          await this.driver.rollback()
-          return { ok: false }
-        }
-      }
-
-      // Apply mutations - all using the same versionstamp
-      for (const mutation of mutations) {
-        const keyHash = this.hashKey(mutation.key)
-
-        if (mutation.type === 'delete') {
-          await this.driver.delete(keyHash)
-        } else if (mutation.type === 'set') {
-          const serializedValue = mutation.value
-
-          if (mutation.expireIn) {
-            const expiresAt = Date.now() + mutation.expireIn
-            await this.driver.set(
-              keyHash,
-              serializedValue,
-              versionstamp,
-              expiresAt,
-            )
-          } else {
-            await this.driver.set(keyHash, serializedValue, versionstamp)
+      return await this.driver.withTransaction(async () => {
+        // Verify all checks pass within the transaction
+        for (const check of checks) {
+          const result = await this.get(check.key)
+          if (result.versionstamp !== check.versionstamp) {
+            return { ok: false }
           }
-        } else if (
-          mutation.type === 'sum' ||
-          mutation.type === 'max' ||
-          mutation.type === 'min'
-        ) {
-          const currentValue = await this.get(mutation.key)
-          let newValue: KvU64
+        }
 
-          if (currentValue.value === null) {
-            newValue = mutation.value
-          } else if (
-            (mutation.type === 'sum' ||
-              mutation.type === 'min' ||
-              mutation.type === 'max') &&
-            !(currentValue.value instanceof KvU64)
-          ) {
-            throw new TypeError(
-              `Failed to perform '${mutation.type}' mutation on a non-U64 value in the database`,
-            )
-          } else if (
-            typeof currentValue.value === 'number' ||
-            typeof currentValue.value === 'bigint' ||
-            currentValue.value instanceof KvU64
-          ) {
-            const current = BigInt(
-              currentValue.value instanceof KvU64
-                ? currentValue.value.value
-                : currentValue.value,
-            )
-            if (mutation.type === 'sum') {
-              newValue = new KvU64(
-                (current + mutation.value.value) & 0xffffffffffffffffn,
-              )
-            } else if (mutation.type === 'max') {
-              newValue = new KvU64(
-                current > mutation.value.value ? current : mutation.value.value,
+        // Apply mutations - all using the same versionstamp
+        for (const mutation of mutations) {
+          const keyHash = this.hashKey(mutation.key)
+
+          if (mutation.type === 'delete') {
+            await this.driver.delete(keyHash)
+          } else if (mutation.type === 'set') {
+            const serializedValue = mutation.value
+
+            if (mutation.expireIn) {
+              const expiresAt = Date.now() + mutation.expireIn
+              await this.driver.set(
+                keyHash,
+                serializedValue,
+                versionstamp,
+                expiresAt,
               )
             } else {
-              newValue = new KvU64(
-                current < mutation.value.value ? current : mutation.value.value,
+              await this.driver.set(keyHash, serializedValue, versionstamp)
+            }
+          } else if (
+            mutation.type === 'sum' ||
+            mutation.type === 'max' ||
+            mutation.type === 'min'
+          ) {
+            const currentValue = await this.get(mutation.key)
+            let newValue: KvU64
+
+            if (currentValue.value === null) {
+              newValue = mutation.value
+            } else if (
+              (mutation.type === 'sum' ||
+                mutation.type === 'min' ||
+                mutation.type === 'max') &&
+              !(currentValue.value instanceof KvU64)
+            ) {
+              throw new TypeError(
+                `Failed to perform '${mutation.type}' mutation on a non-U64 value in the database`,
+              )
+            } else if (
+              typeof currentValue.value === 'number' ||
+              typeof currentValue.value === 'bigint' ||
+              currentValue.value instanceof KvU64
+            ) {
+              const current = BigInt(
+                currentValue.value instanceof KvU64
+                  ? currentValue.value.value
+                  : currentValue.value,
+              )
+              if (mutation.type === 'sum') {
+                newValue = new KvU64(
+                  (current + mutation.value.value) & 0xffffffffffffffffn,
+                )
+              } else if (mutation.type === 'max') {
+                newValue = new KvU64(
+                  current > mutation.value.value
+                    ? current
+                    : mutation.value.value,
+                )
+              } else {
+                newValue = new KvU64(
+                  current < mutation.value.value
+                    ? current
+                    : mutation.value.value,
+                )
+              }
+            } else {
+              throw new TypeError(
+                `Invalid value type for ${mutation.type} operation`,
               )
             }
-          } else {
-            throw new TypeError(
-              `Invalid value type for ${mutation.type} operation`,
-            )
+
+            await this.driver.set(keyHash, newValue, versionstamp)
           }
-
-          await this.driver.set(keyHash, newValue, versionstamp)
         }
-      }
 
-      await this.driver.commit()
-      return { ok: true, versionstamp }
+        return { ok: true, versionstamp }
+      })
     } catch (error) {
-      await this.driver.rollback()
       if (error instanceof TypeError) {
         throw error
       }
@@ -984,12 +977,12 @@ export class Valkeyrie {
 class Atomic {
   private checks: Check[] = []
   private mutations: Mutation[] = []
-  private kv: Valkeyrie
+  private valkeyrie: Valkeyrie
   private totalMutationSize = 0
   private totalKeySize = 0
 
-  constructor(kv: Valkeyrie) {
-    this.kv = kv
+  constructor(valkeyrie: Valkeyrie) {
+    this.valkeyrie = valkeyrie
   }
 
   private validateVersionstamp(versionstamp: string | null): void {
@@ -1010,7 +1003,7 @@ class Atomic {
       if (this.checks.length >= 100) {
         throw new TypeError('Max 100 checks per atomic operation')
       }
-      this.kv.validateKeys([check.key])
+      this.valkeyrie.validateKeys([check.key])
       this.validateVersionstamp(check.versionstamp)
       this.checks.push(check)
     }
@@ -1022,7 +1015,7 @@ class Atomic {
       if (this.mutations.length >= 1000) {
         throw new TypeError('Max 1000 mutations per atomic operation')
       }
-      this.kv.validateKeys([mutation.key])
+      this.valkeyrie.validateKeys([mutation.key])
       if (mutation.key.length === 0) {
         throw new Error('Key cannot be empty')
       }
@@ -1112,6 +1105,6 @@ class Atomic {
     if (this.totalMutationSize > 819200) {
       throw new TypeError('Total mutation size too large (max 819200 bytes)')
     }
-    return this.kv.executeAtomicOperation(this.checks, this.mutations)
+    return this.valkeyrie.executeAtomicOperation(this.checks, this.mutations)
   }
 }
