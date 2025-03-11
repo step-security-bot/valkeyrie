@@ -60,6 +60,7 @@ interface DriverValue {
   key: Buffer
   value: Buffer
   versionstamp: string
+  is_u64: number
 }
 
 const sqliteDriver = defineDriver(async (path = ':memory:') => {
@@ -74,7 +75,8 @@ const sqliteDriver = defineDriver(async (path = ':memory:') => {
       key BLOB NOT NULL,
       value BLOB,
       versionstamp TEXT NOT NULL,
-      expires_at INTEGER
+      expires_at INTEGER,
+      is_u64 INTEGER DEFAULT 0
     );
 
     CREATE INDEX IF NOT EXISTS idx_kv_store_expires_at
@@ -87,43 +89,43 @@ const sqliteDriver = defineDriver(async (path = ':memory:') => {
 
   const statements = {
     get: db.prepare(
-      'SELECT key, value, versionstamp FROM kv_store WHERE key_hash = ? AND (expires_at IS NULL OR expires_at > ?)',
+      'SELECT key, value, versionstamp, is_u64 FROM kv_store WHERE key_hash = ? AND (expires_at IS NULL OR expires_at > ?)',
     ),
     set: db.prepare(
-      'INSERT OR REPLACE INTO kv_store (key_hash, key, value, versionstamp) VALUES (?, ?, ?, ?)',
+      'INSERT OR REPLACE INTO kv_store (key_hash, key, value, versionstamp, is_u64) VALUES (?, ?, ?, ?, ?)',
     ),
     setWithExpiry: db.prepare(
-      'INSERT OR REPLACE INTO kv_store (key_hash, key, value, versionstamp, expires_at) VALUES (?, ?, ?, ?, ?)',
+      'INSERT OR REPLACE INTO kv_store (key_hash, key, value, versionstamp, expires_at, is_u64) VALUES (?, ?, ?, ?, ?, ?)',
     ),
     delete: db.prepare('DELETE FROM kv_store WHERE key_hash = ?'),
     list: db.prepare(
-      'SELECT key, value, versionstamp FROM kv_store WHERE key_hash >= ? AND key_hash < ? AND key_hash != ? AND (expires_at IS NULL OR expires_at > ?) ORDER BY key_hash ASC LIMIT ?',
+      'SELECT key, value, versionstamp, is_u64 FROM kv_store WHERE key_hash >= ? AND key_hash < ? AND key_hash != ? AND (expires_at IS NULL OR expires_at > ?) ORDER BY key_hash ASC LIMIT ?',
     ),
     listReverse: db.prepare(
-      'SELECT key, value, versionstamp FROM kv_store WHERE key_hash >= ? AND key_hash < ? AND key_hash != ? AND (expires_at IS NULL OR expires_at > ?) ORDER BY key_hash DESC LIMIT ?',
+      'SELECT key, value, versionstamp, is_u64 FROM kv_store WHERE key_hash >= ? AND key_hash < ? AND key_hash != ? AND (expires_at IS NULL OR expires_at > ?) ORDER BY key_hash DESC LIMIT ?',
     ),
     cleanup: db.prepare('DELETE FROM kv_store WHERE expires_at <= ?'),
   }
 
-  function serializeValue(value: Value): Buffer {
-    const serialized = serialize(
-      value instanceof KvU64
-        ? { value: value.value, '$valkeyrie.u64': true }
-        : value,
-    )
-    // 65536 + 7 bytes V8 serialization overhead
+  function serializeValue(value: Value): { serialized: Buffer; isU64: number } {
+    const isU64 = value instanceof KvU64 ? 1 : 0
+    const serialized = serialize(isU64 ? (value as KvU64).value : value)
+
     if (serialized.length > 65536 + 7) {
       throw new TypeError('Value too large (max 65536 bytes)')
     }
-    return serialized
+    return {
+      serialized,
+      isU64,
+    }
   }
 
-  function deserializeValue(value: Buffer): Value {
-    const d = deserialize(value)
-    if (d && typeof d === 'object' && '$valkeyrie.u64' in d) {
-      return new KvU64(d.value)
+  function deserializeValue(value: Buffer, isU64: number): Value {
+    const deserialized = deserialize(value)
+    if (isU64) {
+      return new KvU64(deserialized)
     }
-    return d
+    return deserialized
   }
 
   return {
@@ -139,23 +141,24 @@ const sqliteDriver = defineDriver(async (path = ':memory:') => {
       }
       return {
         key: deserialize(result.key),
-        value: deserializeValue(result.value),
+        value: deserializeValue(result.value, result.is_u64),
         versionstamp: result.versionstamp,
       }
     },
     set: async (keyHash, keyParts, value, versionstamp, expiresAt) => {
       const key = serialize(keyParts)
-      const serializedValue = serializeValue(value)
+      const { serialized, isU64 } = serializeValue(value)
       if (expiresAt) {
         statements.setWithExpiry.run(
           keyHash,
           key,
-          serializedValue,
+          serialized,
           versionstamp,
           expiresAt,
+          isU64,
         )
       } else {
-        statements.set.run(keyHash, key, serializedValue, versionstamp)
+        statements.set.run(keyHash, key, serialized, versionstamp, isU64)
       }
     },
     delete: async (keyHash) => {
@@ -187,7 +190,7 @@ const sqliteDriver = defineDriver(async (path = ':memory:') => {
             )) as DriverValue[]
       ).map((r) => ({
         key: deserialize(r.key),
-        value: deserializeValue(r.value),
+        value: deserializeValue(r.value, r.is_u64),
         versionstamp: r.versionstamp,
       }))
     },
