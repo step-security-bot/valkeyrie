@@ -23,10 +23,9 @@ export type Key = KeyPart[]
 
 interface Functions {
   close: () => Promise<void>
-  get: (keyHash: string, now: number) => Promise<Entry | undefined>
+  get: (keyHash: string, now: number) => Promise<DriverValue | undefined>
   set: (
     keyHash: string,
-    keyParts: Key,
     value: Value,
     versionstamp: string,
     expiresAt?: number,
@@ -39,7 +38,7 @@ interface Functions {
     now: number,
     limit: number,
     reverse?: boolean,
-  ) => Promise<Entry[]>
+  ) => Promise<DriverValue[]>
   cleanup: (now: number) => Promise<void>
   beginTransaction: () => Promise<void>
   commit: () => Promise<void>
@@ -57,9 +56,13 @@ export function defineDriver(
 }
 
 interface DriverValue {
-  key: Buffer
-  value: Buffer
+  keyHash: string
+  value: Value
   versionstamp: string
+}
+type SqlTable = Pick<DriverValue, 'versionstamp'> & {
+  key_hash: string
+  value: Buffer
   is_u64: number
 }
 
@@ -72,7 +75,6 @@ const sqliteDriver = defineDriver(async (path = ':memory:') => {
   db.exec(`
     CREATE TABLE IF NOT EXISTS kv_store (
       key_hash TEXT PRIMARY KEY,
-      key BLOB NOT NULL,
       value BLOB,
       versionstamp TEXT NOT NULL,
       expires_at INTEGER,
@@ -89,20 +91,20 @@ const sqliteDriver = defineDriver(async (path = ':memory:') => {
 
   const statements = {
     get: db.prepare(
-      'SELECT key, value, versionstamp, is_u64 FROM kv_store WHERE key_hash = ? AND (expires_at IS NULL OR expires_at > ?)',
+      'SELECT key_hash, value, versionstamp, is_u64 FROM kv_store WHERE key_hash = ? AND (expires_at IS NULL OR expires_at > ?)',
     ),
     set: db.prepare(
-      'INSERT OR REPLACE INTO kv_store (key_hash, key, value, versionstamp, is_u64) VALUES (?, ?, ?, ?, ?)',
+      'INSERT OR REPLACE INTO kv_store (key_hash, value, versionstamp, is_u64) VALUES (?, ?, ?, ?)',
     ),
     setWithExpiry: db.prepare(
-      'INSERT OR REPLACE INTO kv_store (key_hash, key, value, versionstamp, expires_at, is_u64) VALUES (?, ?, ?, ?, ?, ?)',
+      'INSERT OR REPLACE INTO kv_store (key_hash, value, versionstamp, expires_at, is_u64) VALUES (?, ?, ?, ?, ?)',
     ),
     delete: db.prepare('DELETE FROM kv_store WHERE key_hash = ?'),
     list: db.prepare(
-      'SELECT key, value, versionstamp, is_u64 FROM kv_store WHERE key_hash >= ? AND key_hash < ? AND key_hash != ? AND (expires_at IS NULL OR expires_at > ?) ORDER BY key_hash ASC LIMIT ?',
+      'SELECT key_hash, value, versionstamp, is_u64 FROM kv_store WHERE key_hash >= ? AND key_hash < ? AND key_hash != ? AND (expires_at IS NULL OR expires_at > ?) ORDER BY key_hash ASC LIMIT ?',
     ),
     listReverse: db.prepare(
-      'SELECT key, value, versionstamp, is_u64 FROM kv_store WHERE key_hash >= ? AND key_hash < ? AND key_hash != ? AND (expires_at IS NULL OR expires_at > ?) ORDER BY key_hash DESC LIMIT ?',
+      'SELECT key_hash, value, versionstamp, is_u64 FROM kv_store WHERE key_hash >= ? AND key_hash < ? AND key_hash != ? AND (expires_at IS NULL OR expires_at > ?) ORDER BY key_hash DESC LIMIT ?',
     ),
     cleanup: db.prepare('DELETE FROM kv_store WHERE expires_at <= ?'),
   }
@@ -134,23 +136,21 @@ const sqliteDriver = defineDriver(async (path = ':memory:') => {
     },
     get: async (keyHash: string, now: number) => {
       const result = (await statements.get.get(keyHash, now)) as
-        | DriverValue
+        | SqlTable
         | undefined
       if (!result) {
         return undefined
       }
       return {
-        key: deserialize(result.key),
+        keyHash: result.key_hash,
         value: deserializeValue(result.value, result.is_u64),
         versionstamp: result.versionstamp,
       }
     },
-    set: async (keyHash, keyParts, value, versionstamp, expiresAt) => {
-      const key = serialize(keyParts)
+    set: async (key, value, versionstamp, expiresAt) => {
       const { serialized, isU64 } = serializeValue(value)
       if (expiresAt) {
         statements.setWithExpiry.run(
-          keyHash,
           key,
           serialized,
           versionstamp,
@@ -158,7 +158,7 @@ const sqliteDriver = defineDriver(async (path = ':memory:') => {
           isU64,
         )
       } else {
-        statements.set.run(keyHash, key, serialized, versionstamp, isU64)
+        statements.set.run(key, serialized, versionstamp, isU64)
       }
     },
     delete: async (keyHash) => {
@@ -187,9 +187,9 @@ const sqliteDriver = defineDriver(async (path = ':memory:') => {
               prefixHash,
               now,
               limit,
-            )) as DriverValue[]
+            )) as SqlTable[]
       ).map((r) => ({
-        key: deserialize(r.key),
+        keyHash: r.key_hash,
         value: deserializeValue(r.value, r.is_u64),
         versionstamp: r.versionstamp,
       }))
@@ -387,6 +387,122 @@ export class Valkeyrie {
     return fullKey.toString('base64').replace(/=+$/, '')
   }
 
+  /**
+   * Decodes a base64-encoded key hash back into its original key parts.
+   * This method reverses the encoding process performed by hashKey.
+   * It handles the following formats:
+   * - Uint8Array: 0x01 + bytes + 0x00
+   * - String: 0x02 + utf8 bytes + 0x00
+   * - BigInt: 0x03 + 8 bytes int64 + 0x00
+   * - Number: 0x04 + 8 bytes double + 0x00
+   * - Boolean: 0x05 + single byte + 0x00
+   *
+   * @param {string} hash - The base64-encoded key hash to decode
+   * @returns {Key} The decoded key parts array
+   * @throws {Error} If the hash format is invalid or contains an unknown type marker
+   */
+  private decodeKeyHash(hash: string): Key {
+    // Add back padding if needed
+    const padding = '='.repeat((4 - (hash.length % 4)) % 4)
+    const buffer = Buffer.from(hash + padding, 'base64')
+    const parts: KeyPart[] = []
+    let pos = 0
+
+    while (pos < buffer.length) {
+      const typeMarker = buffer[pos] as number
+      pos++
+
+      switch (typeMarker) {
+        case 0x01: {
+          // Uint8Array
+          let end = pos
+          // Find the terminator (0x00) that marks the end of the Uint8Array
+          // We need to scan for it rather than stopping at the first 0 value
+          // since the Uint8Array itself might contain zeros
+          while (end < buffer.length) {
+            // Check if this position is the terminator
+            if (buffer[end] === 0x00) {
+              const nextPos = end + 1
+              // Check if we're at the end of the buffer
+              if (nextPos >= buffer.length) {
+                break
+              }
+
+              // Check if the next byte is a valid type marker
+              const nextByte = buffer[nextPos]
+              if (
+                nextByte === 0x01 ||
+                nextByte === 0x02 ||
+                nextByte === 0x03 ||
+                nextByte === 0x04 ||
+                nextByte === 0x05
+              ) {
+                break
+              }
+            }
+            end++
+          }
+
+          if (end >= buffer.length)
+            throw new Error('Invalid key hash: unterminated Uint8Array')
+          const bytes = buffer.subarray(pos, end)
+          parts.push(new Uint8Array(bytes))
+          pos = end + 1
+          break
+        }
+        case 0x02: {
+          // String
+          let end = pos
+          while (end < buffer.length && buffer[end] !== 0x00) end++
+          if (end >= buffer.length)
+            throw new Error('Invalid key hash: unterminated String')
+          const str = buffer.subarray(pos, end).toString('utf8')
+          parts.push(str)
+          pos = end + 1
+          break
+        }
+        case 0x03: {
+          // BigInt
+          if (pos + 8 >= buffer.length)
+            throw new Error('Invalid key hash: BigInt too short')
+          if (buffer[pos + 8] !== 0x00)
+            throw new Error('Invalid key hash: BigInt not terminated')
+          const hex = buffer.subarray(pos, pos + 8).toString('hex')
+          parts.push(BigInt(`0x${hex}`))
+          pos += 9
+          break
+        }
+        case 0x04: {
+          // Number
+          if (pos + 8 >= buffer.length)
+            throw new Error('Invalid key hash: Number too short')
+          if (buffer[pos + 8] !== 0x00)
+            throw new Error('Invalid key hash: Number not terminated')
+          const num = buffer.readDoubleBE(pos)
+          parts.push(num)
+          pos += 9
+          break
+        }
+        case 0x05: {
+          // Boolean
+          if (pos >= buffer.length)
+            throw new Error('Invalid key hash: Boolean too short')
+          if (buffer[pos + 1] !== 0x00)
+            throw new Error('Invalid key hash: Boolean not terminated')
+          parts.push(buffer[pos] === 1)
+          pos += 2
+          break
+        }
+        default:
+          throw new Error(
+            `Invalid key hash: unknown type marker 0x${typeMarker.toString(16)}`,
+          )
+      }
+    }
+
+    return parts
+  }
+
   async get<T = unknown>(key: Key): Promise<EntryMaybe<T>> {
     this.validateKeys([key])
     if (key.length === 0) {
@@ -401,7 +517,7 @@ export class Valkeyrie {
     }
 
     return {
-      key: result.key,
+      key: this.decodeKeyHash(result.keyHash),
       value: result.value as T,
       versionstamp: result.versionstamp,
     }
@@ -429,7 +545,6 @@ export class Valkeyrie {
 
     await this.driver.set(
       keyHash,
-      key,
       value,
       versionstamp,
       options.expireIn ? Date.now() + options.expireIn : undefined,
@@ -496,7 +611,7 @@ export class Valkeyrie {
 
       for (const result of results) {
         yield {
-          key: result.key,
+          key: this.decodeKeyHash(result.keyHash),
           value: result.value as T,
           versionstamp: result.versionstamp,
         }
@@ -508,8 +623,7 @@ export class Valkeyrie {
       // Update hash bounds for next batch
       const lastResult = results[results.length - 1]
       if (!lastResult) break
-      const lastKey = lastResult.key
-      const lastKeyHash = this.hashKey(lastKey)
+      const lastKeyHash = lastResult.keyHash
       if (reverse) {
         currentEndHash = lastKeyHash
       } else {
@@ -785,7 +899,6 @@ export class Valkeyrie {
       // Apply mutations - all using the same versionstamp
       for (const mutation of mutations) {
         const keyHash = this.hashKey(mutation.key)
-        const keyParts = mutation.key
 
         if (mutation.type === 'delete') {
           await this.driver.delete(keyHash)
@@ -796,18 +909,12 @@ export class Valkeyrie {
             const expiresAt = Date.now() + mutation.expireIn
             await this.driver.set(
               keyHash,
-              keyParts,
               serializedValue,
               versionstamp,
               expiresAt,
             )
           } else {
-            await this.driver.set(
-              keyHash,
-              keyParts,
-              serializedValue,
-              versionstamp,
-            )
+            await this.driver.set(keyHash, serializedValue, versionstamp)
           }
         } else if (
           mutation.type === 'sum' ||
@@ -857,14 +964,7 @@ export class Valkeyrie {
             )
           }
 
-          // Store the KvU64 instance directly
-          const serializedValue = newValue
-          await this.driver.set(
-            keyHash,
-            keyParts,
-            serializedValue,
-            versionstamp,
-          )
+          await this.driver.set(keyHash, newValue, versionstamp)
         }
       }
 
