@@ -11,3 +11,31 @@
 
 
 `Valkeyrie` is a Node.js key-value store.
+
+## Benchmarks
+
+Valkeyrie includes a comprehensive benchmarking suite to measure performance and track regressions over time. The benchmarks test various operations including:
+
+- Basic operations (get, set, delete)
+- List operations
+- Atomic operations
+
+### Running Benchmarks
+
+You can run the benchmarks using the following commands:
+
+```bash
+# Run all benchmarks
+pnpm benchmark
+
+# Run specific benchmark suites
+pnpm benchmark:basic    # Basic operations
+pnpm benchmark:list     # List operations
+pnpm benchmark:atomic   # Atomic operations
+```
+
+### Benchmark Results
+
+Benchmark results are automatically tracked in CI for pull requests, allowing us to identify performance regressions before they're merged into the main branch.
+
+For more details on the benchmarking methodology and how to add new benchmarks, see the [benchmark README](./benchmark/README.md).
