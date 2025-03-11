@@ -1,6 +1,6 @@
 import { DatabaseSync } from 'node:sqlite'
 import { deserialize, serialize } from 'node:v8'
-import { KvU64 } from './kvu64.js'
+import { KvU64 } from './kv-u64.js'
 
 type PrimitveValue =
   | undefined
@@ -21,18 +21,13 @@ export type Value = PrimitveValue | KvU64
 export type KeyPart = Uint8Array | string | number | bigint | boolean
 export type Key = KeyPart[]
 
-interface DriverValue {
-  key: Buffer
-  value: Buffer
-  versionstamp: string
-}
 interface Functions {
   close: () => Promise<void>
-  get: (keyHash: string, now: number) => Promise<DriverValue | undefined>
+  get: (keyHash: string, now: number) => Promise<Entry | undefined>
   set: (
     keyHash: string,
-    keyParts: Buffer,
-    value: Buffer,
+    keyParts: Key,
+    value: Value,
     versionstamp: string,
     expiresAt?: number,
   ) => Promise<void>
@@ -44,7 +39,7 @@ interface Functions {
     now: number,
     limit: number,
     reverse?: boolean,
-  ) => Promise<DriverValue[]>
+  ) => Promise<Entry[]>
   cleanup: (now: number) => Promise<void>
   beginTransaction: () => Promise<void>
   commit: () => Promise<void>
@@ -59,6 +54,12 @@ export function defineDriver(
   }
 
   return async () => initDriver
+}
+
+interface DriverValue {
+  key: Buffer
+  value: Buffer
+  versionstamp: string
 }
 
 const sqliteDriver = defineDriver(async (path = ':memory:') => {
@@ -104,13 +105,47 @@ const sqliteDriver = defineDriver(async (path = ':memory:') => {
     cleanup: db.prepare('DELETE FROM kv_store WHERE expires_at <= ?'),
   }
 
+  function serializeValue(value: Value): Buffer {
+    const serialized = serialize(
+      value instanceof KvU64
+        ? { value: value.value, '$valkeyrie.u64': true }
+        : value,
+    )
+    // 65536 + 7 bytes V8 serialization overhead
+    if (serialized.length > 65536 + 7) {
+      throw new TypeError('Value too large (max 65536 bytes)')
+    }
+    return serialized
+  }
+
+  function deserializeValue(value: Buffer): Value {
+    const d = deserialize(value)
+    if (d && typeof d === 'object' && '$valkeyrie.u64' in d) {
+      return new KvU64(d.value)
+    }
+    return d
+  }
+
   return {
     close: async () => {
       db.close()
     },
-    get: async (keyHash: string, now: number) =>
-      statements.get.get(keyHash, now) as DriverValue | undefined,
-    set: async (keyHash, key, serializedValue, versionstamp, expiresAt) => {
+    get: async (keyHash: string, now: number) => {
+      const result = (await statements.get.get(keyHash, now)) as
+        | DriverValue
+        | undefined
+      if (!result) {
+        return undefined
+      }
+      return {
+        key: deserialize(result.key),
+        value: deserializeValue(result.value),
+        versionstamp: result.versionstamp,
+      }
+    },
+    set: async (keyHash, keyParts, value, versionstamp, expiresAt) => {
+      const key = serialize(keyParts)
+      const serializedValue = serializeValue(value)
       if (expiresAt) {
         statements.setWithExpiry.run(
           keyHash,
@@ -134,22 +169,27 @@ const sqliteDriver = defineDriver(async (path = ':memory:') => {
       limit,
       reverse = false,
     ) => {
-      if (reverse) {
-        return statements.listReverse.all(
-          startHash,
-          endHash,
-          prefixHash,
-          now,
-          limit,
-        ) as DriverValue[]
-      }
-      return statements.list.all(
-        startHash,
-        endHash,
-        prefixHash,
-        now,
-        limit,
-      ) as DriverValue[]
+      return (
+        (reverse
+          ? statements.listReverse.all(
+              startHash,
+              endHash,
+              prefixHash,
+              now,
+              limit,
+            )
+          : statements.list.all(
+              startHash,
+              endHash,
+              prefixHash,
+              now,
+              limit,
+            )) as DriverValue[]
+      ).map((r) => ({
+        key: deserialize(r.key),
+        value: deserializeValue(r.value),
+        versionstamp: r.versionstamp,
+      }))
     },
     cleanup: async (now) => {
       statements.cleanup.run(now)
@@ -274,35 +314,6 @@ export class Valkeyrie {
     return this.lastVersionstamp.toString(16).padStart(20, '0')
   }
 
-  private serializeKey(key: Key): Buffer {
-    return serialize(key)
-  }
-
-  private deserializeKey(keyStr: Buffer): Key {
-    return deserialize(keyStr)
-  }
-
-  private serializeValue(value: Value): Buffer {
-    const serialized = serialize(
-      value instanceof KvU64
-        ? { value: value.value, '$valkeyrie.u64': true }
-        : value,
-    )
-    // 65536 + 7 bytes V8 serialization overhead
-    if (serialized.length > 65536 + 7) {
-      throw new TypeError('Value too large (max 65536 bytes)')
-    }
-    return serialized
-  }
-
-  private deserializeValue(value: Buffer): Value {
-    const d = deserialize(value)
-    if (d && typeof d === 'object' && '$valkeyrie.u64' in d) {
-      return new KvU64(d.value)
-    }
-    return d
-  }
-
   /**
    * Generates a hash for a given key. This method is crucial for indexing and storing keys in the database.
    * It converts each part of the key into a specific byte format based on its type, following Deno.KV's encoding format.
@@ -387,8 +398,8 @@ export class Valkeyrie {
     }
 
     return {
-      key: this.deserializeKey(result.key),
-      value: this.deserializeValue(result.value) as T,
+      key: result.key,
+      value: result.value as T,
       versionstamp: result.versionstamp,
     }
   }
@@ -411,14 +422,12 @@ export class Valkeyrie {
       throw new Error('Key cannot be empty')
     }
     const keyHash = this.hashKey(key)
-    const keyParts = this.serializeKey(key)
-    const serializedValue = this.serializeValue(value)
     const versionstamp = this.generateVersionstamp()
 
     await this.driver.set(
       keyHash,
-      keyParts,
-      serializedValue,
+      key,
+      value,
       versionstamp,
       options.expireIn ? Date.now() + options.expireIn : undefined,
     )
@@ -484,8 +493,8 @@ export class Valkeyrie {
 
       for (const result of results) {
         yield {
-          key: this.deserializeKey(result.key),
-          value: this.deserializeValue(result.value) as T,
+          key: result.key,
+          value: result.value as T,
           versionstamp: result.versionstamp,
         }
       }
@@ -496,7 +505,7 @@ export class Valkeyrie {
       // Update hash bounds for next batch
       const lastResult = results[results.length - 1]
       if (!lastResult) break
-      const lastKey = this.deserializeKey(lastResult.key)
+      const lastKey = lastResult.key
       const lastKeyHash = this.hashKey(lastKey)
       if (reverse) {
         currentEndHash = lastKeyHash
@@ -773,12 +782,12 @@ export class Valkeyrie {
       // Apply mutations - all using the same versionstamp
       for (const mutation of mutations) {
         const keyHash = this.hashKey(mutation.key)
-        const keyParts = this.serializeKey(mutation.key)
+        const keyParts = mutation.key
 
         if (mutation.type === 'delete') {
           await this.driver.delete(keyHash)
         } else if (mutation.type === 'set') {
-          const serializedValue = this.serializeValue(mutation.value)
+          const serializedValue = mutation.value
 
           if (mutation.expireIn) {
             const expiresAt = Date.now() + mutation.expireIn
@@ -846,7 +855,7 @@ export class Valkeyrie {
           }
 
           // Store the KvU64 instance directly
-          const serializedValue = this.serializeValue(newValue)
+          const serializedValue = newValue
           await this.driver.set(
             keyHash,
             keyParts,

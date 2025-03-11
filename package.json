@@ -9,6 +9,10 @@
       "import": "./dist/valkeyrie.js",
       "require": "./dist/valkeyrie.js"
     },
+    "./KvU64": {
+      "import": "./dist/kv-u64.js",
+      "require": "./dist/kv-u64.js"
+    },
     "./package.json": "./package.json"
   },
   "author": "Maksim Sinik <maksim@sinik.it>",
