@@ -1,5 +1,0 @@
----
-"valkeyrie": minor
----
-
-Add benchmarks
