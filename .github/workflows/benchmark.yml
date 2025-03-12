@@ -6,21 +6,31 @@ on:
     branches: [main]
   workflow_dispatch:
 
+permissions: read-all
+
+env:
+  NODE_VERSION: 22.14.0
+  PNPM_VERSION: 10.6.2
+
 jobs:
   benchmark:
     name: Run benchmarks
     runs-on: ubuntu-latest
     steps:
+      - name: Harden Runner
+        uses: step-security/harden-runner@4d991eb9b905ef189e4c376166672c3f2f230481 # v2.11.0
+        with:
+          egress-policy: audit
       - uses: actions/checkout@v4
+        name: Checkout
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: 20
-          cache: 'pnpm'
+          node-version: ${{ env.NODE_VERSION }}
       - name: Install pnpm
         uses: pnpm/action-setup@v3
         with:
-          version: 10
+          version: ${{ env.PNPM_VERSION }}
           run_install: false
       - name: Install dependencies
         run: pnpm install
