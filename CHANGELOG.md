@@ -1,5 +1,11 @@
 # valkeyrie
 
+## 0.1.0
+
+### Minor Changes
+
+- 5f552f9: Add benchmarks
+
 ## 0.0.3
 
 ### Patch Changes
