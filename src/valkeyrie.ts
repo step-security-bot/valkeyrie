@@ -1020,7 +1020,6 @@ class Atomic {
         throw new Error('Key cannot be empty')
       }
 
-      // Track key size without validation
       const keySize = serialize(mutation.key).length
       this.totalKeySize += keySize
 
