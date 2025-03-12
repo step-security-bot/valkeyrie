@@ -2,4 +2,4 @@
 "valkeyrie": minor
 ---
 
-Add benchmark
+Add benchmarks
