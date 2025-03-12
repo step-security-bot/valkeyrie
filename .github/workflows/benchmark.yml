@@ -35,10 +35,4 @@ jobs:
       - name: Install dependencies
         run: pnpm install
       - name: Run benchmarks
-        run: pnpm benchmark > benchmark-results.txt
-      - name: Upload benchmark results
-        uses: actions/upload-artifact@v4
-        with:
-          name: benchmark-results
-          path: benchmark-results.txt
-          retention-days: 90
+        run: pnpm benchmark
